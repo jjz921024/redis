@@ -1,0 +1,21 @@
+Webank fork redis release note
+
+## v1.0.0
+  - module client增加readonly flag
+
+## v1.1.0
+  增加集合类型元素个数上限的限制
+  - 涉及类型和命令
+    - list: rpush, rpushx, lpush, lpushx, linsert, lset
+    - hash: hmset, hset, hincrby, hincrbyfloat
+    - set: sadd
+    - zset: zadd, zincrby
+  - 增加元素个数上限的配置参数 elements-limit
+    可运行时修改, 0表示不限制, config get/set elements-limit
+
+  注意: 
+    1. 只要集合类型达到上限, 所有写入和更新操作都会被拒绝, 读取和删除操作不受影响
+       例如: list达到上限后, rpush会返回错误, lpop和ltrim不受影响
+    2. 校验逻辑是在命令执行前, 计算 命令涉及的元素个数 + 命令执行前集合类型元素个数 是否大于限制
+       例如: 限制集合上限为1000, 当前list元素个数为900, rpush 101个元素时会返回错误, rpush 2个元素会返回成功
+    3. 限制检查是在redis进程内执行, 只涉及简单的结构体字段检查, 不涉及网络IO, 因此对性能的影响微乎其微

@@ -310,6 +310,9 @@ void saddCommand(client *c) {
     if (set == NULL) {
         set = setTypeCreate(c->argv[2]->ptr);
         dbAdd(c->db,c->argv[1],set);
+    } else if (server.elements_limit > 0 && setTypeSize(set) + c->argc - 2 > server.elements_limit) {
+        addReply(c, shared.toomuchelememterr);
+        return;
     }
 
     for (j = 2; j < c->argc; j++) {

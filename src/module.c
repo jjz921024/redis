@@ -8457,7 +8457,7 @@ void moduleRegisterCoreAPI(void);
  * been initialized, see #7323. */
 void moduleInitModulesSystemLast(void) {
     moduleFreeContextReusedClient = createClient(NULL);
-    moduleFreeContextReusedClient->flags |= CLIENT_MODULE;
+    moduleFreeContextReusedClient->flags |= (CLIENT_MODULE | CLIENT_READONLY);
     moduleFreeContextReusedClient->user = NULL; /* root user. */
 }
 

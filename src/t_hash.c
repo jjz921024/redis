@@ -666,6 +666,10 @@ void hsetCommand(client *c) {
     }
 
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    if (server.elements_limit > 0 && hashTypeLength(o) + (c->argc - 2) / 2 > server.elements_limit) {
+        addReply(c, shared.toomuchelememterr);
+        return;
+    }
     hashTypeTryConversion(o,c->argv,2,c->argc-1);
 
     for (i = 2; i < c->argc; i += 2)
@@ -694,6 +698,10 @@ void hincrbyCommand(client *c) {
 
     if (getLongLongFromObjectOrReply(c,c->argv[3],&incr,NULL) != C_OK) return;
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    if (server.elements_limit > 0 && hashTypeLength(o) + 1 > server.elements_limit) {
+        addReply(c, shared.toomuchelememterr);
+        return;
+    }
     if (hashTypeGetValue(o,c->argv[2]->ptr,&vstr,&vlen,&value) == C_OK) {
         if (vstr) {
             if (string2ll((char*)vstr,vlen,&value) == 0) {
@@ -734,6 +742,10 @@ void hincrbyfloatCommand(client *c) {
         return;
     }
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    if (server.elements_limit > 0 && hashTypeLength(o) + 1 > server.elements_limit) {
+        addReply(c, shared.toomuchelememterr);
+        return;
+    }
     if (hashTypeGetValue(o,c->argv[2]->ptr,&vstr,&vlen,&ll) == C_OK) {
         if (vstr) {
             if (string2ld((char*)vstr,vlen,&value) == 0) {

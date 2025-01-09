@@ -1807,6 +1807,9 @@ void zaddGenericCommand(client *c, int flags) {
             zobj = createZsetZiplistObject();
         }
         dbAdd(c->db,key,zobj);
+    } else if (server.elements_limit > 0 && zsetLength(zobj) + elements > server.elements_limit) {
+        addReply(c, shared.toomuchelememterr);
+        goto cleanup;
     }
 
     for (j = 0; j < elements; j++) {

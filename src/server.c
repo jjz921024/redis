@@ -2540,6 +2540,8 @@ void createSharedObjects(void) {
         "-NOREPLICAS Not enough good replicas to write.\r\n"));
     shared.busykeyerr = createObject(OBJ_STRING,sdsnew(
         "-BUSYKEY Target key name already exists.\r\n"));
+    shared.toomuchelememterr = createObject(OBJ_STRING,sdsnew(
+        "-TOOMUCHELEMEMT Too much elements of complex type.\r\n"));
 
     /* The shared NULL depends on the protocol version. */
     shared.null[0] = NULL;

@@ -245,6 +245,10 @@ void pushGenericCommand(client *c, int where, int xx) {
         quicklistSetOptions(lobj->ptr, server.list_max_ziplist_size,
                             server.list_compress_depth);
         dbAdd(c->db,c->argv[1],lobj);
+    } else if (lobj && server.elements_limit > 0 && 
+               listTypeLength(lobj) + c->argc - 2 > server.elements_limit) {
+        addReplyErrorObject(c,shared.toomuchelememterr);
+        return;
     }
 
     for (j = 2; j < c->argc; j++) {

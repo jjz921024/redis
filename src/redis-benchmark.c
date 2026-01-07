@@ -1891,6 +1891,12 @@ int main(int argc, char **argv) {
             free(cmd);
         }
 
+        if (test_is_selected("setex")) {
+            len = redisFormatCommand(&cmd,"SET key%s:__rand_int__ %s EX 1",tag,data);
+            benchmark("SETEX",cmd,len);
+            free(cmd);
+        }
+
         if (test_is_selected("get")) {
             len = redisFormatCommand(&cmd,"GET key%s:__rand_int__",tag);
             benchmark("GET",cmd,len);

@@ -134,6 +134,38 @@ typedef long long ustime_t;
 #define REDISMODULE_CONFIG_BITFLAGS (1ULL<<8) /* Indicates if this value can be set as a multiple enum values */
 #define REDISMODULE_CONFIG_UNPREFIXED (1ULL<<9) /* Provided configuration name won't be prefixed with the module name */
 
+/* Command flags. */
+#define CMD_WRITE (1ULL<<0)
+#define CMD_READONLY (1ULL<<1)
+#define CMD_DENYOOM (1ULL<<2)
+#define CMD_MODULE (1ULL<<3)           /* Command exported by module. */
+#define CMD_ADMIN (1ULL<<4)
+#define CMD_PUBSUB (1ULL<<5)
+#define CMD_NOSCRIPT (1ULL<<6)
+#define CMD_BLOCKING (1ULL<<8)       /* Has potential to block. */
+#define CMD_LOADING (1ULL<<9)
+#define CMD_STALE (1ULL<<10)
+#define CMD_SKIP_MONITOR (1ULL<<11)
+#define CMD_SKIP_SLOWLOG (1ULL<<12)
+#define CMD_ASKING (1ULL<<13)
+#define CMD_FAST (1ULL<<14)
+#define CMD_NO_AUTH (1ULL<<15)
+#define CMD_MAY_REPLICATE (1ULL<<16)
+#define CMD_SENTINEL (1ULL<<17)
+#define CMD_ONLY_SENTINEL (1ULL<<18)
+#define CMD_NO_MANDATORY_KEYS (1ULL<<19)
+#define CMD_PROTECTED (1ULL<<20)
+#define CMD_MODULE_GETKEYS (1ULL<<21)  /* Use the modules getkeys interface. */
+#define CMD_MODULE_NO_CLUSTER (1ULL<<22) /* Deny on Redis Cluster. */
+#define CMD_NO_ASYNC_LOADING (1ULL<<23)
+#define CMD_NO_MULTI (1ULL<<24)
+#define CMD_MOVABLE_KEYS (1ULL<<25) /* The legacy range spec doesn't cover all keys.
+                                     * Populated by populateCommandLegacyRangeSpec. */
+#define CMD_ALLOW_BUSY ((1ULL<<26))
+#define CMD_MODULE_GETCHANNELS (1ULL<<27)  /* Use the modules getchannels interface. */
+#define CMD_TOUCHES_ARBITRARY_KEYS (1ULL<<28)
+#define CMD_INTERNAL (1ULL<<29) /* Internal command. */
+
 /* StreamID type. */
 typedef struct RedisModuleStreamID {
     uint64_t ms;
@@ -1046,6 +1078,7 @@ REDISMODULE_API char * (*RedisModule_Strdup)(const char *str) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_GetApi)(const char *, void *) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_CreateCommand)(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc cmdfunc, const char *strflags, int firstkey, int lastkey, int keystep) REDISMODULE_ATTR;
 REDISMODULE_API RedisModuleCommand *(*RedisModule_GetCommand)(RedisModuleCtx *ctx, const char *name) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_GetCommandFlags)(const char *cmd, uint64_t *flags) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_CreateSubcommand)(RedisModuleCommand *parent, const char *name, RedisModuleCmdFunc cmdfunc, const char *strflags, int firstkey, int lastkey, int keystep) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_SetCommandInfo)(RedisModuleCommand *command, const RedisModuleCommandInfo *info) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_SetCommandACLCategories)(RedisModuleCommand *command, const char *ctgrsflags) REDISMODULE_ATTR;
@@ -1181,6 +1214,7 @@ REDISMODULE_API int (*RedisModule_SetClientNameById)(uint64_t id, RedisModuleStr
 REDISMODULE_API int (*RedisModule_PublishMessage)(RedisModuleCtx *ctx, RedisModuleString *channel, RedisModuleString *message) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_PublishMessageShard)(RedisModuleCtx *ctx, RedisModuleString *channel, RedisModuleString *message) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_GetContextFlags)(RedisModuleCtx *ctx) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_GetFilterContextFlags)(RedisModuleCommandFilterCtx *fctx) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_AvoidReplicaTraffic)(void) REDISMODULE_ATTR;
 REDISMODULE_API void * (*RedisModule_PoolAlloc)(RedisModuleCtx *ctx, size_t bytes) REDISMODULE_ATTR;
 REDISMODULE_API RedisModuleType * (*RedisModule_CreateDataType)(RedisModuleCtx *ctx, const char *name, int encver, RedisModuleTypeMethods *typemethods) REDISMODULE_ATTR;
@@ -1297,6 +1331,7 @@ REDISMODULE_API int (*RedisModule_GetServerVersion)(void) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_GetTypeMethodVersion)(void) REDISMODULE_ATTR;
 REDISMODULE_API void (*RedisModule_Yield)(RedisModuleCtx *ctx, int flags, const char *busy_reply) REDISMODULE_ATTR;
 REDISMODULE_API RedisModuleBlockedClient * (*RedisModule_BlockClient)(RedisModuleCtx *ctx, RedisModuleCmdFunc reply_callback, RedisModuleCmdFunc timeout_callback, void (*free_privdata)(RedisModuleCtx*,void*), long long timeout_ms) REDISMODULE_ATTR;
+REDISMODULE_API RedisModuleBlockedClient * (*RedisModule_BlockClientOnCommandFilter)(RedisModuleCommandFilterCtx *fctx, RedisModuleCmdFunc reply_callback, RedisModuleCmdFunc timeout_callback, void (*free_privdata)(RedisModuleCommandFilterCtx*,void*), long long timeout_ms) REDISMODULE_ATTR;
 REDISMODULE_API void * (*RedisModule_BlockClientGetPrivateData)(RedisModuleBlockedClient *blocked_client) REDISMODULE_ATTR;
 REDISMODULE_API void (*RedisModule_BlockClientSetPrivateData)(RedisModuleBlockedClient *blocked_client, void *private_data) REDISMODULE_ATTR;
 REDISMODULE_API RedisModuleBlockedClient * (*RedisModule_BlockClientOnAuth)(RedisModuleCtx *ctx, RedisModuleAuthCallback reply_callback, void (*free_privdata)(RedisModuleCtx*,void*)) REDISMODULE_ATTR;
@@ -1350,7 +1385,14 @@ REDISMODULE_API RedisModuleString * (*RedisModule_CommandFilterArgGet)(RedisModu
 REDISMODULE_API int (*RedisModule_CommandFilterArgInsert)(RedisModuleCommandFilterCtx *fctx, int pos, RedisModuleString *arg) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_CommandFilterArgReplace)(RedisModuleCommandFilterCtx *fctx, int pos, RedisModuleString *arg) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_CommandFilterArgDelete)(RedisModuleCommandFilterCtx *fctx, int pos) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_CommandFilterSetAbort)(RedisModuleCommandFilterCtx *fctx, int abort) REDISMODULE_ATTR;
 REDISMODULE_API unsigned long long (*RedisModule_CommandFilterGetClientId)(RedisModuleCommandFilterCtx *fctx) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_CommandFilterReplyWithLongLong)(RedisModuleCommandFilterCtx *fctx, long long ll) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_CommandFilterReplyWithError)(RedisModuleCommandFilterCtx *fctx, const char *err) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_CommandFilterReplyWithSimpleString)(RedisModuleCommandFilterCtx *fctx, const char *msg) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_CommandFilterReplyWithArray)(RedisModuleCommandFilterCtx *fctx, long len) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_CommandFilterReplyWithNull)(RedisModuleCommandFilterCtx *fctx) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_CommandFilterReplyWithStringBuffer)(RedisModuleCommandFilterCtx *fctx, const char *buf, size_t len) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_Fork)(RedisModuleForkDoneHandler cb, void *user_data) REDISMODULE_ATTR;
 REDISMODULE_API void (*RedisModule_SendChildHeartbeat)(double progress) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_ExitFromChild)(int retcode) REDISMODULE_ATTR;
@@ -1438,6 +1480,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(TryRealloc);
     REDISMODULE_GET_API(Strdup);
     REDISMODULE_GET_API(CreateCommand);
+    REDISMODULE_GET_API(GetCommandFlags);
     REDISMODULE_GET_API(GetCommand);
     REDISMODULE_GET_API(CreateSubcommand);
     REDISMODULE_GET_API(SetCommandInfo);
@@ -1456,6 +1499,12 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(ReplyWithAttribute);
     REDISMODULE_GET_API(ReplyWithNullArray);
     REDISMODULE_GET_API(ReplyWithEmptyArray);
+    REDISMODULE_GET_API(CommandFilterReplyWithLongLong);
+    REDISMODULE_GET_API(CommandFilterReplyWithError);
+    REDISMODULE_GET_API(CommandFilterReplyWithSimpleString);
+    REDISMODULE_GET_API(CommandFilterReplyWithArray);
+    REDISMODULE_GET_API(CommandFilterReplyWithNull);
+    REDISMODULE_GET_API(CommandFilterReplyWithStringBuffer);
     REDISMODULE_GET_API(ReplySetArrayLength);
     REDISMODULE_GET_API(ReplySetMapLength);
     REDISMODULE_GET_API(ReplySetSetLength);
@@ -1569,6 +1618,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(GetClientId);
     REDISMODULE_GET_API(GetClientUserNameById);
     REDISMODULE_GET_API(GetContextFlags);
+    REDISMODULE_GET_API(GetFilterContextFlags);
     REDISMODULE_GET_API(AvoidReplicaTraffic);
     REDISMODULE_GET_API(PoolAlloc);
     REDISMODULE_GET_API(CreateDataType);
@@ -1696,6 +1746,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(ThreadSafeContextTryLock);
     REDISMODULE_GET_API(ThreadSafeContextUnlock);
     REDISMODULE_GET_API(BlockClient);
+    REDISMODULE_GET_API(BlockClientOnCommandFilter);
     REDISMODULE_GET_API(BlockClientGetPrivateData);
     REDISMODULE_GET_API(BlockClientSetPrivateData);
     REDISMODULE_GET_API(BlockClientOnAuth);
@@ -1743,6 +1794,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(CommandFilterArgInsert);
     REDISMODULE_GET_API(CommandFilterArgReplace);
     REDISMODULE_GET_API(CommandFilterArgDelete);
+    REDISMODULE_GET_API(CommandFilterSetAbort);
     REDISMODULE_GET_API(CommandFilterGetClientId);
     REDISMODULE_GET_API(Fork);
     REDISMODULE_GET_API(SendChildHeartbeat);

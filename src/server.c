@@ -4171,7 +4171,10 @@ int processCommand(client *c) {
 
     /* only run command filter if not reprocessing command */
     if (!client_reprocessing_command) {
-        moduleCallCommandFilters(c);
+        if (moduleCallCommandFilters(c) != REDISMODULE_OK) {
+            /* Command was blocked by a filter */
+            return C_OK;
+        }
         reqresAppendRequest(c);
     }
 

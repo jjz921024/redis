@@ -51,6 +51,7 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <string.h>
+#include <time.h>
 
 /* --------------------------------------------------------------------------
  * Private data structures used by the modules system. Those are data
@@ -349,6 +350,7 @@ typedef struct RedisModuleCommandFilterCtx {
     int argv_len;
     int argc;
     client *c;
+    int abort;
 } RedisModuleCommandFilterCtx;
 
 typedef void (*RedisModuleCommandFilterFunc) (RedisModuleCommandFilterCtx *filter);
@@ -1361,6 +1363,23 @@ RedisModuleCommand *moduleCreateCommandProxy(struct RedisModule *module, sds dec
     cp->rediscmd->rejected_calls = 0;
     cp->rediscmd->failed_calls = 0;
     return cp;
+}
+
+/* Retrieve the flags of a command.
+ *
+ * Returns REDISMODULE_OK on success, storing the command flags into the `flags` pointer.
+ * Returns REDISMODULE_ERR if the command is not exists.
+ *
+ * The flags value is a bitmask of CMD_* flags defined in server.h
+ */
+int RM_GetCommandFlags(const char *name, uint64_t *flags) {
+    struct redisCommand *cmd = lookupCommandByCString(name);
+
+    if (!cmd)
+        return REDISMODULE_ERR;
+
+    *flags = cmd->flags;
+    return REDISMODULE_OK;
 }
 
 /* Get an opaque structure, representing a module command, by command name.
@@ -3941,30 +3960,28 @@ int RM_GetSelectedDb(RedisModuleCtx *ctx) {
  *  * REDISMODULE_CTX_FLAGS_DEBUG_ENABLED: Debug commands are enabled for this
  *                                         context.
  */
-int RM_GetContextFlags(RedisModuleCtx *ctx) {
+int getContextFlags(client *client, struct RedisModuleBlockedClient *blocked_client) {
     int flags = 0;
 
     /* Client specific flags */
-    if (ctx) {
-        if (ctx->client) {
-            if (ctx->client->flags & CLIENT_DENY_BLOCKING)
-                flags |= REDISMODULE_CTX_FLAGS_DENY_BLOCKING;
-            /* Module command received from MASTER, is replicated. */
-            if (ctx->client->flags & CLIENT_MASTER)
-                flags |= REDISMODULE_CTX_FLAGS_REPLICATED;
-            if (ctx->client->resp == 3) {
-                flags |= REDISMODULE_CTX_FLAGS_RESP3;
-            }
+    if (client) {
+        if (client->flags & CLIENT_DENY_BLOCKING)
+            flags |= REDISMODULE_CTX_FLAGS_DENY_BLOCKING;
+        /* Module command received from MASTER, is replicated. */
+        if (client->flags & CLIENT_MASTER)
+            flags |= REDISMODULE_CTX_FLAGS_REPLICATED;
+        if (client->resp == 3) {
+            flags |= REDISMODULE_CTX_FLAGS_RESP3;
         }
+    }
 
-        /* For DIRTY flags, we need the blocked client if used */
-        client *c = ctx->blocked_client ? ctx->blocked_client->client : ctx->client;
-        if (c && (c->flags & (CLIENT_DIRTY_CAS|CLIENT_DIRTY_EXEC))) {
-            flags |= REDISMODULE_CTX_FLAGS_MULTI_DIRTY;
-        }
-        if (c && allowProtectedAction(server.enable_debug_cmd, c)) {
-            flags |= REDISMODULE_CTX_FLAGS_DEBUG_ENABLED;
-        }
+    /* For DIRTY flags, we need the blocked client if used */
+    struct client *c = blocked_client ? blocked_client->client : client;
+    if (c && (c->flags & (CLIENT_DIRTY_CAS|CLIENT_DIRTY_EXEC))) {
+        flags |= REDISMODULE_CTX_FLAGS_MULTI_DIRTY;
+    }
+    if (c && allowProtectedAction(server.enable_debug_cmd, c)) {
+        flags |= REDISMODULE_CTX_FLAGS_DEBUG_ENABLED;
     }
 
     if (scriptIsRunning())
@@ -4038,6 +4055,14 @@ int RM_GetContextFlags(RedisModuleCtx *ctx) {
     }
 
     return flags;
+}
+
+int RM_GetContextFlags(RedisModuleCtx *ctx) {
+    return getContextFlags(ctx->client, ctx->blocked_client);
+}
+
+int RM_GetFilterContextFlags(RedisModuleCommandFilterCtx *fctx) {
+    return getContextFlags(fctx->c, NULL);
 }
 
 /* Returns true if a client sent the CLIENT PAUSE command to the server or
@@ -6582,7 +6607,11 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     }
 
     /* Call command filters */
-    moduleCallCommandFilters(c);
+    if (moduleCallCommandFilters(c) != REDISMODULE_OK) {
+        /* Command was blocked by a filter */
+        errno = EACCES;
+        goto cleanup;
+    }
 
     /* Lookup command now, after filters had a chance to make modifications
      * if necessary.
@@ -8332,6 +8361,49 @@ RedisModuleBlockedClient *RM_BlockClient(RedisModuleCtx *ctx, RedisModuleCmdFunc
     return moduleBlockClient(ctx,reply_callback,NULL,timeout_callback,free_privdata,timeout_ms, NULL,0,NULL,0);
 }
 
+RedisModuleBlockedClient *RM_BlockClientOnCommandFilter(RedisModuleCommandFilterCtx *fctx, RedisModuleCmdFunc reply_callback, RedisModuleCmdFunc timeout_callback, void (*free_privdata)(RedisModuleCommandFilterCtx*,void*), long long timeout_ms) {
+
+    client *c = fctx->c;
+    int islua = scriptIsRunning();
+    int ismulti = server.in_exec;
+
+    c->bstate.module_blocked_handle = zcalloc(sizeof(RedisModuleBlockedClient));
+    RedisModuleBlockedClient *bc = c->bstate.module_blocked_handle;
+    // ctx->module->blocked_clients++;
+
+    bc->client = (islua || ismulti) ? NULL : c;
+    bc->module = NULL;
+    bc->reply_callback = reply_callback;
+    bc->timeout_callback = timeout_callback;
+    bc->disconnect_callback = NULL; /* Set by RM_SetDisconnectCallback() */
+    /* bc->free_privdata = free_privdata;
+    bc->privdata = privdata; */
+    bc->reply_client = moduleAllocTempClient();
+    bc->thread_safe_ctx_client = moduleAllocTempClient();
+    if (bc->client)
+        bc->reply_client->resp = bc->client->resp;
+    bc->dbid = c->db->id;
+    bc->blocked_on_keys = 0;
+    bc->unblocked = 0;
+    bc->background_timer = 0;
+    bc->background_duration = 0;
+
+    mstime_t timeout = 0;
+    if (timeout_ms) {
+        mstime_t now = mstime();
+        if (timeout_ms > LLONG_MAX - now) {
+            c->bstate.module_blocked_handle = NULL;
+            addReplyError(c, "timeout is out of range"); /* 'timeout_ms+now' would overflow */
+            return bc;
+        }
+        timeout = timeout_ms + now;
+    }
+
+    c->bstate.timeout = timeout;
+    blockClient(c,BLOCKED_MODULE);
+    return bc;
+}
+
 /* Block the current client for module authentication in the background. If module auth is not in
  * progress on the client, the API returns NULL. Otherwise, the client is blocked and the RM_BlockedClient
  * is returned similar to the RM_BlockClient API.
@@ -8635,7 +8707,7 @@ void moduleHandleBlockedClients(void) {
         /* Free 'bc' only after unblocking the client, since it is
          * referenced in the client blocking context, and must be valid
          * when calling unblockClient(). */
-        if (!(c && clientHasModuleAuthInProgress(c))) {
+        if (!(c && clientHasModuleAuthInProgress(c)) && bc->module) {
             bc->module->blocked_clients--;
             zfree(bc);
         }
@@ -11221,8 +11293,8 @@ int RM_UnregisterCommandFilter(RedisModuleCtx *ctx, RedisModuleCommandFilter *fi
     return REDISMODULE_OK;
 }
 
-void moduleCallCommandFilters(client *c) {
-    if (listLength(moduleCommandFilters) == 0) return;
+int moduleCallCommandFilters(client *c) {
+    if (listLength(moduleCommandFilters) == 0) return REDISMODULE_OK;
 
     listIter li;
     listNode *ln;
@@ -11232,7 +11304,8 @@ void moduleCallCommandFilters(client *c) {
         .argv = c->argv,
         .argv_len = c->argv_len,
         .argc = c->argc,
-        .c = c
+        .c = c,
+        .abort = 0,
     };
 
     while((ln = listNext(&li))) {
@@ -11269,6 +11342,8 @@ void moduleCallCommandFilters(client *c) {
         getKeysFreeResult(&pcmd->keys_result);
         pcmd->keys_result = (getKeysResult)GETKEYS_RESULT_INIT;
     }
+
+    return filter.abort ? REDISMODULE_ERR : REDISMODULE_OK;
 }
 
 /* Return the number of arguments a filtered command has.  The number of
@@ -11344,9 +11419,100 @@ int RM_CommandFilterArgDelete(RedisModuleCommandFilterCtx *fctx, int pos)
     return REDISMODULE_OK;
 }
 
+/* Set the abort status of the current command.
+ *
+ * This function can be called by a command filter to set whether
+ * the command should be aborted or allowed to continue.
+ *
+ * Parameters:
+ * - fctx: The command filter context
+ * - abort: Non-zero value to block the command, 0 to allow it to continue
+ *
+ * Use this function to override a previous block or to explicitly allow
+ * a command that was previously aborted.
+ */
+int RM_CommandFilterSetAbort(RedisModuleCommandFilterCtx *fctx, int abort) {
+    fctx->abort = abort;
+    return REDISMODULE_OK;
+}
+
 /* Get Client ID for client that issued the command we are filtering */
 unsigned long long RM_CommandFilterGetClientId(RedisModuleCommandFilterCtx *fctx) {
     return fctx->c->id;
+}
+
+/* Reply with a long long integer to the client using the filter context.
+ * The function always returns REDISMODULE_OK. */
+int RM_CommandFilterReplyWithLongLong(RedisModuleCommandFilterCtx *fctx, long long ll) {
+    client *c = fctx->c;
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyLongLong(c, ll);
+    return REDISMODULE_OK;
+}
+
+/* Reply with an error to the client using the filter context.
+ *
+ * Note that 'err' must contain all the error, including
+ * the initial error code. The function only provides the initial "-", so
+ * the usage is, for example:
+ *
+ *     RedisModule_CommandFilterReplyWithError(fctx,"ERR Wrong Type");
+ *
+ * The function always returns REDISMODULE_OK.
+ */
+int RM_CommandFilterReplyWithError(RedisModuleCommandFilterCtx *fctx, const char *err) {
+    client *c = fctx->c;
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyErrorFormat(c, "-%s", err);
+    return REDISMODULE_OK;
+}
+
+/* Reply with a simple string to the client using the filter context.
+ * This replies are suitable only when sending a small non-binary string
+ * with small overhead, like "OK" or similar replies.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_CommandFilterReplyWithSimpleString(RedisModuleCommandFilterCtx *fctx, const char *msg) {
+    client *c = fctx->c;
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyProto(c, "+", 1);
+    addReplyProto(c, msg, strlen(msg));
+    addReplyProto(c, "\r\n", 2);
+    return REDISMODULE_OK;
+}
+
+/* Reply with an array type to the client using the filter context.
+ *
+ * Note: This is a simplified version that only supports fixed-length arrays.
+ * For deferred length arrays, additional work would be needed.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_CommandFilterReplyWithArray(RedisModuleCommandFilterCtx *fctx, long len) {
+    client *c = fctx->c;
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyArrayLen(c, len);
+    return REDISMODULE_OK;
+}
+
+/* Reply with a null to the client using the filter context.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_CommandFilterReplyWithNull(RedisModuleCommandFilterCtx *fctx) {
+    client *c = fctx->c;
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyNull(c);
+    return REDISMODULE_OK;
+}
+
+/* Reply with a bulk string to the client using the filter context,
+ * taking in input a C buffer pointer and length.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_CommandFilterReplyWithStringBuffer(RedisModuleCommandFilterCtx *fctx, const char *buf, size_t len) {
+    client *c = fctx->c;
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyBulkCBuffer(c, (char*)buf, len);
+    return REDISMODULE_OK;
 }
 
 /* For a given pointer allocated via RedisModule_Alloc() or
@@ -14857,6 +15023,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(TryRealloc);
     REGISTER_API(Free);
     REGISTER_API(Strdup);
+    REGISTER_API(GetCommandFlags);
     REGISTER_API(CreateCommand);
     REGISTER_API(GetCommand);
     REGISTER_API(CreateSubcommand);
@@ -14988,6 +15155,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(GetClientId);
     REGISTER_API(GetClientUserNameById);
     REGISTER_API(GetContextFlags);
+    REGISTER_API(GetFilterContextFlags);
     REGISTER_API(AvoidReplicaTraffic);
     REGISTER_API(PoolAlloc);
     REGISTER_API(CreateDataType);
@@ -15039,6 +15207,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(GetKeyNameFromDigest);
     REGISTER_API(GetDbIdFromDigest);
     REGISTER_API(BlockClient);
+    REGISTER_API(BlockClientOnCommandFilter);
     REGISTER_API(BlockClientGetPrivateData);
     REGISTER_API(BlockClientSetPrivateData);
     REGISTER_API(BlockClientOnAuth);
@@ -15121,7 +15290,14 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(CommandFilterArgInsert);
     REGISTER_API(CommandFilterArgReplace);
     REGISTER_API(CommandFilterArgDelete);
+    REGISTER_API(CommandFilterSetAbort);
     REGISTER_API(CommandFilterGetClientId);
+    REGISTER_API(CommandFilterReplyWithLongLong);
+    REGISTER_API(CommandFilterReplyWithError);
+    REGISTER_API(CommandFilterReplyWithSimpleString);
+    REGISTER_API(CommandFilterReplyWithArray);
+    REGISTER_API(CommandFilterReplyWithNull);
+    REGISTER_API(CommandFilterReplyWithStringBuffer);
     REGISTER_API(Fork);
     REGISTER_API(SendChildHeartbeat);
     REGISTER_API(ExitFromChild);
